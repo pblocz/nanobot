@@ -12,7 +12,7 @@ from typing import Any, Literal
 from loguru import logger
 from pydantic import Field
 from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
-from telegram.error import TimedOut
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -486,10 +486,14 @@ class TelegramChannel(BaseChannel):
         int_chat_id = int(chat_id)
 
         if meta.get("_stream_end"):
-            buf = self._stream_bufs.get(chat_id)
+            # Fix 1: always stop typing regardless of buf state.
+            self._stop_typing(chat_id)
+            # Fix 2: always clean up buf immediately, before any I/O that could raise.
+            buf = self._stream_bufs.pop(chat_id, None)
             if not buf or not buf.message_id or not buf.text:
                 return
-            self._stop_typing(chat_id)
+            # Fix 3: final edit is best-effort — message was already delivered via
+            # streaming deltas.  Never raise here; there is nothing worth retrying.
             try:
                 html = _markdown_to_telegram_html(buf.text)
                 await self._call_with_retry(
@@ -497,6 +501,19 @@ class TelegramChannel(BaseChannel):
                     chat_id=int_chat_id, message_id=buf.message_id,
                     text=html, parse_mode="HTML",
                 )
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    logger.debug("Final stream edit skipped (content unchanged): {}", e)
+                else:
+                    logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
+                    try:
+                        await self._call_with_retry(
+                            self._app.bot.edit_message_text,
+                            chat_id=int_chat_id, message_id=buf.message_id,
+                            text=buf.text,
+                        )
+                    except Exception as e2:
+                        logger.warning("Final stream edit failed: {}", e2)
             except Exception as e:
                 logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
                 try:
@@ -507,8 +524,6 @@ class TelegramChannel(BaseChannel):
                     )
                 except Exception as e2:
                     logger.warning("Final stream edit failed: {}", e2)
-                    raise  # Let ChannelManager handle retry
-            self._stream_bufs.pop(chat_id, None)
             return
 
         buf = self._stream_bufs.get(chat_id)
@@ -533,6 +548,9 @@ class TelegramChannel(BaseChannel):
                 logger.warning("Stream initial send failed: {}", e)
                 raise  # Let ChannelManager handle retry
         elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
+            # Fix 4: do not raise on intermediate edit failures.  The next delta
+            # will carry the correct accumulated text anyway; raising here blocks
+            # _dispatch_outbound and causes text duplication on retry.
             try:
                 await self._call_with_retry(
                     self._app.bot.edit_message_text,
@@ -541,8 +559,7 @@ class TelegramChannel(BaseChannel):
                 )
                 buf.last_edit = now
             except Exception as e:
-                logger.warning("Stream edit failed: {}", e)
-                raise  # Let ChannelManager handle retry
+                logger.warning("Stream edit failed (will retry on next delta): {}", e)
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
