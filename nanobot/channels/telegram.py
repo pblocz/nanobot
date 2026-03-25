@@ -163,7 +163,6 @@ class _StreamBuf:
     text: str = ""
     message_id: int | None = None
     last_edit: float = 0.0
-    stream_id: str | None = None
 
 
 class TelegramConfig(Base):
@@ -479,25 +478,24 @@ class TelegramChannel(BaseChannel):
                 logger.error("Error sending Telegram message: {}", e2)
                 raise
 
-    @staticmethod
-    def _is_not_modified_error(exc: Exception) -> bool:
-        return isinstance(exc, BadRequest) and "message is not modified" in str(exc).lower()
-
     async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
         """Progressive message editing: send on first delta, edit on subsequent ones."""
         if not self._app:
             return
         meta = metadata or {}
         int_chat_id = int(chat_id)
-        stream_id = meta.get("_stream_id")
 
         if meta.get("_stream_end"):
-            buf = self._stream_bufs.get(chat_id)
-            if not buf or not buf.message_id or not buf.text:
-                return
-            if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
-                return
+            # Always clean up buf immediately, before any I/O that could raise.
+            buf = self._stream_bufs.pop(chat_id, None)
+            # Stop typing now; restart it below if more processing is coming.
             self._stop_typing(chat_id)
+            if not buf or not buf.message_id or not buf.text:
+                if meta.get("_resuming"):
+                    self._start_typing(chat_id)
+                return
+            # Fix 3: final edit is best-effort — message was already delivered via
+            # streaming deltas.  Never raise here; there is nothing worth retrying.
             try:
                 html = _markdown_to_telegram_html(buf.text)
                 await self._call_with_retry(
@@ -505,11 +503,20 @@ class TelegramChannel(BaseChannel):
                     chat_id=int_chat_id, message_id=buf.message_id,
                     text=html, parse_mode="HTML",
                 )
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    logger.debug("Final stream edit skipped (content unchanged): {}", e)
+                else:
+                    logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
+                    try:
+                        await self._call_with_retry(
+                            self._app.bot.edit_message_text,
+                            chat_id=int_chat_id, message_id=buf.message_id,
+                            text=buf.text,
+                        )
+                    except Exception as e2:
+                        logger.warning("Final stream edit failed: {}", e2)
             except Exception as e:
-                if self._is_not_modified_error(e):
-                    logger.debug("Final stream edit already applied for {}", chat_id)
-                    self._stream_bufs.pop(chat_id, None)
-                    return
                 logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
                 try:
                     await self._call_with_retry(
@@ -518,21 +525,17 @@ class TelegramChannel(BaseChannel):
                         text=buf.text,
                     )
                 except Exception as e2:
-                    if self._is_not_modified_error(e2):
-                        logger.debug("Final stream plain edit already applied for {}", chat_id)
-                        self._stream_bufs.pop(chat_id, None)
-                        return
                     logger.warning("Final stream edit failed: {}", e2)
-                    raise  # Let ChannelManager handle retry
-            self._stream_bufs.pop(chat_id, None)
+            # If the agent is resuming (tool calls follow), keep the typing indicator
+            # alive so the user knows processing is still ongoing.
+            if meta.get("_resuming"):
+                self._start_typing(chat_id)
             return
 
         buf = self._stream_bufs.get(chat_id)
-        if buf is None or (stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id):
-            buf = _StreamBuf(stream_id=stream_id)
+        if buf is None:
+            buf = _StreamBuf()
             self._stream_bufs[chat_id] = buf
-        elif buf.stream_id is None:
-            buf.stream_id = stream_id
         buf.text += delta
 
         if not buf.text.strip():
@@ -551,6 +554,9 @@ class TelegramChannel(BaseChannel):
                 logger.warning("Stream initial send failed: {}", e)
                 raise  # Let ChannelManager handle retry
         elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
+            # Fix 4: do not raise on intermediate edit failures.  The next delta
+            # will carry the correct accumulated text anyway; raising here blocks
+            # _dispatch_outbound and causes text duplication on retry.
             try:
                 await self._call_with_retry(
                     self._app.bot.edit_message_text,
@@ -559,11 +565,7 @@ class TelegramChannel(BaseChannel):
                 )
                 buf.last_edit = now
             except Exception as e:
-                if self._is_not_modified_error(e):
-                    buf.last_edit = now
-                    return
-                logger.warning("Stream edit failed: {}", e)
-                raise  # Let ChannelManager handle retry
+                logger.warning("Stream edit failed (will retry on next delta): {}", e)
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -916,12 +918,7 @@ class TelegramChannel(BaseChannel):
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
-        from telegram.error import NetworkError, TimedOut
-        
-        if isinstance(context.error, (NetworkError, TimedOut)):
-            logger.warning("Telegram network issue: {}", str(context.error))
-        else:
-            logger.error("Telegram error: {}", context.error)
+        logger.error("Telegram error: {}", context.error)
 
     def _get_extension(
         self,
