@@ -301,3 +301,135 @@ class TestSubagentCancellation:
         assert cancelled.is_set()
         assert task.cancelled()
         mgr._announce_result.assert_not_awaited()
+
+
+from nanobot.providers.base import LLMResponse, ToolCallRequest
+
+
+def _make_real_loop(tmp_path):
+    """AgentLoop backed by a real SessionManager for session-persistence tests."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.providers.base import GenerationSettings
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=0)
+    provider.estimate_prompt_tokens.return_value = (0, "mock")
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    return loop
+
+
+class TestStopPreservesSession:
+    """Verify that /stop saves the user message to the session."""
+
+    @pytest.mark.asyncio
+    async def test_stop_during_tool_execution_leaves_no_orphan(self, tmp_path):
+        """Cancel while the FIRST tool is executing must not leave an orphaned tool call.
+
+        AgentRunner.run() starts with messages = list(spec.initial_messages), so
+        initial_messages is never mutated regardless of what happens inside the runner.
+        The _partial checkpoint therefore always holds a clean user-message-only snapshot.
+        """
+        loop = _make_real_loop(tmp_path)
+
+        tool_started = asyncio.Event()
+
+        async def scripted_chat(**kwargs):
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="c1", name="slow_tool", arguments={})],
+            )
+
+        loop.runner.provider.chat_with_retry = scripted_chat
+        loop.runner.provider.chat_stream_with_retry = scripted_chat
+
+        async def slow_tool(name, arguments):
+            tool_started.set()
+            await asyncio.sleep(3600)
+
+        loop.tools.execute = slow_tool
+
+        from nanobot.bus.events import InboundMessage
+
+        msg = InboundMessage(
+            channel="cli", sender_id="user", chat_id="direct",
+            content="What is the capital of France?",
+        )
+
+        task = asyncio.create_task(loop._dispatch(msg))
+        await asyncio.wait_for(tool_started.wait(), timeout=2.0)
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        session = loop.sessions.get_or_create(msg.session_key)
+        roles = [m["role"] for m in session.messages]
+        contents = [m.get("content", "") for m in session.messages]
+
+        assert "user" in roles, "user message was not saved after /stop"
+        assert any("France" in str(c) for c in contents), "user message content not saved"
+
+        # No orphaned assistant tool_calls (assistant with tool_calls but no matching result)
+        saved = session.messages
+        tool_result_ids = {m.get("tool_call_id") for m in saved if m.get("role") == "tool"}
+        orphan = [
+            m for m in saved
+            if m.get("role") == "assistant"
+            and m.get("tool_calls")
+            and not all(
+                tc.get("id") in tool_result_ids
+                for tc in (m.get("tool_calls") or [])
+                if isinstance(tc, dict)
+            )
+        ]
+        assert not orphan, (
+            "orphaned assistant tool_call in session after /stop — "
+            "would cause 'tool call result does not follow tool call' on next request"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_preserves_user_message(self, tmp_path):
+        """Cancelling an in-flight task (during LLM call) must still save the user's message."""
+        loop = _make_real_loop(tmp_path)
+
+        ready = asyncio.Event()
+
+        async def hanging_chat(**kwargs):
+            ready.set()
+            await asyncio.sleep(3600)
+
+        loop.runner.provider.chat_with_retry = hanging_chat
+        loop.runner.provider.chat_stream_with_retry = hanging_chat
+
+        from nanobot.bus.events import InboundMessage
+
+        msg = InboundMessage(
+            channel="cli", sender_id="user", chat_id="direct",
+            content="What is the capital of France?",
+        )
+
+        task = asyncio.create_task(loop._dispatch(msg))
+        await asyncio.wait_for(ready.wait(), timeout=2.0)
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        session = loop.sessions.get_or_create(msg.session_key)
+        roles = [m["role"] for m in session.messages]
+        contents = [m.get("content", "") for m in session.messages]
+        assert "user" in roles, "user message was not saved after /stop"
+        assert any("France" in str(c) for c in contents), "user message content not saved"
