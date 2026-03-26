@@ -310,8 +310,11 @@ class AgentLoop:
                     )
                 # Checkpoint after every complete tool-call round so callers
                 # can persist partial progress if the task is cancelled.
+                # Use list() to snapshot: add_assistant_message / add_tool_result
+                # mutate the messages list in place, so without a copy the ref
+                # would track the live (possibly orphaned) state.
                 if _partial_ref is not None:
-                    _partial_ref[0] = messages
+                    _partial_ref[0] = list(messages)
             else:
                 if on_stream and on_stream_end:
                     await on_stream_end(resuming=False)
@@ -523,7 +526,10 @@ class AgentLoop:
 
         # Tracks last clean checkpoint: starts as user message only, updated
         # after each complete tool-call round inside _run_agent_loop.
-        _partial = [initial_messages]
+        # Must be a copy: _run_agent_loop mutates the list in place via
+        # add_assistant_message / add_tool_result, so without a copy
+        # _partial[0] would silently accumulate orphaned tool calls.
+        _partial = [list(initial_messages)]
 
         try:
             final_content, _, all_msgs = await self._run_agent_loop(

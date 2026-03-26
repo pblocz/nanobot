@@ -35,16 +35,95 @@ class TestStopPreservesSession:
     """Verify that /stop saves at least the user message to the session."""
 
     @pytest.mark.asyncio
-    async def test_stop_preserves_user_message(self, tmp_path):
-        """Cancelling an in-flight task must still save the user's message."""
+    async def test_stop_during_tool_execution_leaves_no_orphan(self, tmp_path):
+        """Cancel while the FIRST tool is executing must not leave an orphaned tool call.
+
+        Root bug: add_assistant_message mutates the messages list in place.
+        If _partial[0] shares the same list object, it silently accumulates
+        assistant(tool_calls=[...]) before the gather completes — so the
+        checkpoint already contains the orphaned call when CancelledError fires.
+        The fix is to snapshot with list() at each checkpoint.
+        """
         loop = _make_real_loop(tmp_path)
 
-        # Provider hangs indefinitely — simulates a slow LLM that gets /stop'd
+        # LLM returns a tool call; the tool itself hangs so cancel fires
+        # while asyncio.gather is blocking inside _run_agent_loop.
+        tool_started = asyncio.Event()
+
+        async def scripted_chat(**kwargs):
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="c1", name="slow_tool", arguments={})],
+            )
+
+        loop.provider.chat_with_retry = scripted_chat
+        loop.provider.chat_stream_with_retry = scripted_chat
+
+        async def slow_tool(name, arguments):
+            tool_started.set()
+            await asyncio.sleep(3600)  # hangs until cancelled
+
+        loop.tools.execute = slow_tool
+
+        from nanobot.bus.events import InboundMessage
+
+        msg = InboundMessage(
+            channel="cli", sender_id="user", chat_id="direct",
+            content="What is the capital of France?",
+        )
+
+        task = asyncio.create_task(loop._dispatch(msg))
+        # Wait until we're inside the tool (i.e. inside asyncio.gather)
+        await asyncio.wait_for(tool_started.wait(), timeout=2.0)
+
+        # Cancel — simulates /stop while the tool is mid-execution
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        session = loop.sessions.get_or_create(msg.session_key)
+        roles = [m["role"] for m in session.messages]
+        contents = [m.get("content", "") for m in session.messages]
+
+        assert "user" in roles, "user message was not saved after /stop"
+        assert any("France" in str(c) for c in contents), (
+            "user message content was not saved after /stop"
+        )
+
+        # The critical check: no assistant message with tool_calls without a
+        # matching tool result — that would cause the Minimax
+        # "tool call result does not follow tool call" error on the next request.
+        saved = session.messages
+        tool_result_ids = {
+            m.get("tool_call_id") for m in saved if m.get("role") == "tool"
+        }
+        orphan = [
+            m for m in saved
+            if m.get("role") == "assistant"
+            and m.get("tool_calls")
+            and not all(
+                tc.get("id") in tool_result_ids
+                for tc in (m.get("tool_calls") or [])
+                if isinstance(tc, dict)
+            )
+        ]
+        assert not orphan, (
+            "orphaned assistant tool_call saved to session after /stop during tool execution — "
+            "would cause 'tool call result does not follow tool call' on next LLM request"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_preserves_user_message(self, tmp_path):
+        """Cancelling an in-flight task (during LLM call) must still save the user's message."""
+        loop = _make_real_loop(tmp_path)
+
         ready = asyncio.Event()
 
         async def hanging_chat(**kwargs):
             ready.set()
-            await asyncio.sleep(3600)  # never returns normally
+            await asyncio.sleep(3600)
 
         loop.provider.chat_with_retry = hanging_chat
         loop.provider.chat_stream_with_retry = hanging_chat
@@ -56,18 +135,15 @@ class TestStopPreservesSession:
             content="What is the capital of France?",
         )
 
-        # Start dispatch as a task and wait until the provider is entered
         task = asyncio.create_task(loop._dispatch(msg))
         await asyncio.wait_for(ready.wait(), timeout=2.0)
 
-        # Cancel — simulates /stop
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
 
-        # The user message must be persisted to the session
         session = loop.sessions.get_or_create(msg.session_key)
         roles = [m["role"] for m in session.messages]
         contents = [m.get("content", "") for m in session.messages]
