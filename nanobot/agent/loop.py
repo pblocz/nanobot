@@ -538,14 +538,27 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            channel=msg.channel, chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-        )
+        # _partial holds initial_messages as a fallback checkpoint.
+        # AgentRunner.run() starts with messages = list(spec.initial_messages),
+        # so initial_messages is never mutated — it is always a safe snapshot of
+        # the user turn and any pre-existing history.
+        _partial = [initial_messages]
+
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                channel=msg.channel, chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
+        except asyncio.CancelledError:
+            # /stop cancels the task before _run_agent_loop returns.
+            # Persist the user message so session history is not lost.
+            self._save_turn(session, _partial[0], 1 + len(history))
+            self.sessions.save(session)
+            raise
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
