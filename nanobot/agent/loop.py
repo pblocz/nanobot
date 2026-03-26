@@ -456,12 +456,6 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        # _partial holds initial_messages as a fallback checkpoint.
-        # AgentRunner.run() starts with messages = list(spec.initial_messages),
-        # so initial_messages is never mutated — it is always a safe snapshot of
-        # the user turn and any pre-existing history.
-        _partial = [initial_messages]
-
         try:
             final_content, _, all_msgs = await self._run_agent_loop(
                 initial_messages,
@@ -474,7 +468,7 @@ class AgentLoop:
         except asyncio.CancelledError:
             # /stop cancels the task before _run_agent_loop returns.
             # Persist the user message so session history is not lost.
-            self._save_turn(session, _partial[0], 1 + len(history))
+            self._save_turn(session, initial_messages, 1 + len(history))
             self.sessions.save(session)
             raise
 
