@@ -206,6 +206,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        _partial_ref: list | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -307,6 +308,10 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                # Checkpoint after every complete tool-call round so callers
+                # can persist partial progress if the task is cancelled.
+                if _partial_ref is not None:
+                    _partial_ref[0] = messages
             else:
                 if on_stream and on_stream_end:
                     await on_stream_end(resuming=False)
@@ -516,14 +521,27 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            channel=msg.channel, chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-        )
+        # Tracks last clean checkpoint: starts as user message only, updated
+        # after each complete tool-call round inside _run_agent_loop.
+        _partial = [initial_messages]
+
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                channel=msg.channel, chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+                _partial_ref=_partial,
+            )
+        except asyncio.CancelledError:
+            # /stop cancels the task before _run_agent_loop returns.
+            # Save whatever completed up to the last clean checkpoint so the
+            # user message (and any finished tool-call rounds) aren't lost.
+            self._save_turn(session, _partial[0], 1 + len(history))
+            self.sessions.save(session)
+            raise
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."

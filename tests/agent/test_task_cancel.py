@@ -7,6 +7,131 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.providers.base import LLMResponse, ToolCallRequest
+
+
+def _make_real_loop(tmp_path):
+    """AgentLoop backed by a real SessionManager for session-persistence tests."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.providers.base import GenerationSettings
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=0)
+    provider.estimate_prompt_tokens.return_value = (0, "mock")
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    return loop
+
+
+class TestStopPreservesSession:
+    """Verify that /stop saves at least the user message to the session."""
+
+    @pytest.mark.asyncio
+    async def test_stop_preserves_user_message(self, tmp_path):
+        """Cancelling an in-flight task must still save the user's message."""
+        loop = _make_real_loop(tmp_path)
+
+        # Provider hangs indefinitely — simulates a slow LLM that gets /stop'd
+        ready = asyncio.Event()
+
+        async def hanging_chat(**kwargs):
+            ready.set()
+            await asyncio.sleep(3600)  # never returns normally
+
+        loop.provider.chat_with_retry = hanging_chat
+        loop.provider.chat_stream_with_retry = hanging_chat
+
+        from nanobot.bus.events import InboundMessage
+
+        msg = InboundMessage(
+            channel="cli", sender_id="user", chat_id="direct",
+            content="What is the capital of France?",
+        )
+
+        # Start dispatch as a task and wait until the provider is entered
+        task = asyncio.create_task(loop._dispatch(msg))
+        await asyncio.wait_for(ready.wait(), timeout=2.0)
+
+        # Cancel — simulates /stop
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # The user message must be persisted to the session
+        session = loop.sessions.get_or_create(msg.session_key)
+        roles = [m["role"] for m in session.messages]
+        contents = [m.get("content", "") for m in session.messages]
+        assert "user" in roles, "user message was not saved after /stop"
+        assert any("France" in str(c) for c in contents), (
+            "user message content was not saved after /stop"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_after_tool_round_preserves_tool_results(self, tmp_path):
+        """If one tool-call round completes before /stop, it is also saved."""
+        loop = _make_real_loop(tmp_path)
+
+        # Register a no-op tool so the loop can execute the tool call
+        from nanobot.agent.tools.registry import ToolRegistry
+
+        async def _noop_execute(name, arguments):
+            return "tool-result"
+
+        loop.tools.execute = _noop_execute
+
+        # Round 1: LLM returns a tool call
+        # Round 2: LLM hangs (gets cancelled)
+        call_count = {"n": 0}
+        round2_entered = asyncio.Event()
+
+        async def scripted_chat(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return LLMResponse(
+                    content="",
+                    tool_calls=[ToolCallRequest(id="c1", name="noop", arguments={})],
+                )
+            # Second call: hang until cancelled
+            round2_entered.set()
+            await asyncio.sleep(3600)
+
+        loop.provider.chat_with_retry = scripted_chat
+        loop.provider.chat_stream_with_retry = scripted_chat
+
+        from nanobot.bus.events import InboundMessage
+
+        msg = InboundMessage(
+            channel="cli", sender_id="user", chat_id="direct",
+            content="Use the noop tool please.",
+        )
+
+        task = asyncio.create_task(loop._dispatch(msg))
+        await asyncio.wait_for(round2_entered.wait(), timeout=2.0)
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        session = loop.sessions.get_or_create(msg.session_key)
+        roles = [m["role"] for m in session.messages]
+
+        # user message + assistant(tool_call) + tool result must all be present
+        assert "user" in roles, "user message missing after /stop mid-tool-round"
+        assert "assistant" in roles, "assistant tool-call message missing after /stop"
+        assert "tool" in roles, "tool result missing after /stop"
+
 
 def _make_loop(*, exec_config=None):
     """Create a minimal AgentLoop with mocked dependencies."""
