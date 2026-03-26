@@ -486,11 +486,13 @@ class TelegramChannel(BaseChannel):
         int_chat_id = int(chat_id)
 
         if meta.get("_stream_end"):
-            # Fix 1: always stop typing regardless of buf state.
-            self._stop_typing(chat_id)
-            # Fix 2: always clean up buf immediately, before any I/O that could raise.
+            # Always clean up buf immediately, before any I/O that could raise.
             buf = self._stream_bufs.pop(chat_id, None)
+            # Stop typing now; restart it below if more processing is coming.
+            self._stop_typing(chat_id)
             if not buf or not buf.message_id or not buf.text:
+                if meta.get("_resuming"):
+                    self._start_typing(chat_id)
                 return
             # Fix 3: final edit is best-effort — message was already delivered via
             # streaming deltas.  Never raise here; there is nothing worth retrying.
@@ -524,6 +526,10 @@ class TelegramChannel(BaseChannel):
                     )
                 except Exception as e2:
                     logger.warning("Final stream edit failed: {}", e2)
+            # If the agent is resuming (tool calls follow), keep the typing indicator
+            # alive so the user knows processing is still ongoing.
+            if meta.get("_resuming"):
+                self._start_typing(chat_id)
             return
 
         buf = self._stream_bufs.get(chat_id)
