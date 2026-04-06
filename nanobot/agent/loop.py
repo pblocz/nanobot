@@ -693,17 +693,26 @@ class AgentLoop:
                 )
             )
 
-        final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            session=session,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-            pending_queue=pending_queue,
-        )
+        try:
+            final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                session=session,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+                pending_queue=pending_queue,
+            )
+        except asyncio.CancelledError:
+            # /stop cancels the task before _run_agent_loop returns.
+            # Persist the user message so session history is not lost.
+            # AgentRunner.run() works on list(spec.initial_messages) and never
+            # mutates the original, so initial_messages is always a clean snapshot.
+            self._save_turn(session, initial_messages, 1 + len(history))
+            self.sessions.save(session)
+            raise
 
         if final_content is None or not final_content.strip():
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE
