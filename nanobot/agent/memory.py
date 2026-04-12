@@ -212,6 +212,11 @@ class MemoryStore:
     def write_user(self, content: str) -> None:
         self.user_file.write_text(content, encoding="utf-8")
 
+    # -- TOOLS.md ------------------------------------------------------------
+
+    def read_tools(self) -> str:
+        return self.read_file(self.workspace / "TOOLS.md")
+
     # -- context injection (used by context.py) ------------------------------
 
     def get_memory_context(self) -> str:
@@ -657,12 +662,14 @@ class Dream:
         current_memory = self.store.read_memory() or "(empty)"
         current_soul = self.store.read_soul() or "(empty)"
         current_user = self.store.read_user() or "(empty)"
+        current_tools = self.store.read_tools() or "(empty)"
 
         file_context = (
             f"## Current Date\n{current_date}\n\n"
             f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
-            f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
+            f"## Current USER.md ({len(current_user)} chars)\n{current_user}\n\n"
+            f"## Current TOOLS.md ({len(current_tools)} chars)\n{current_tools}"
         )
 
         # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
